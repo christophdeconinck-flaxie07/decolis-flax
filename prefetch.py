@@ -41,9 +41,10 @@ REGION_DEFS = [
     {"name": "Flevoland", "country": "NL", "bbox": [52.22, 5.15, 52.75, 5.90], "size": 8},
 ]
 
-PARALLEL_WORKERS = 6  # We have ~21 calls per period, batch by region
+PARALLEL_WORKERS = 3  # Reduced to avoid Open-Meteo per-minute rate limit
 HTTP_TIMEOUT = 60  # seconds - bulk responses are bigger
 MAX_RETRIES = 3
+PERIOD_PAUSE = 5  # seconds pause between historical periods to respect rate limits
 
 
 def generate_grid(bbox, n):
@@ -71,13 +72,15 @@ def http_get_json(url):
         except urllib.error.HTTPError as e:
             last_err = e
             if e.code == 429 and attempt < MAX_RETRIES:
-                time.sleep(3 * (attempt + 1))
+                # Exponentiële backoff: 10s, 20s, 40s
+                wait = 10 * (2 ** attempt)
+                time.sleep(wait)
             else:
                 raise
         except Exception as e:
             last_err = e
             if attempt < MAX_RETRIES:
-                time.sleep(2)
+                time.sleep(3)
             else:
                 raise
     raise last_err if last_err else Exception("Unknown error")
@@ -323,6 +326,9 @@ def main():
                 period_results[region['name']] = {"error": "all points failed"}
         historical[period] = period_results
         print(f"  → {period} done in {time.time()-t0:.1f}s ({ok_regions}/{len(regions)} regions ok)", flush=True)
+        # Korte pauze om Open-Meteo per-minuut limiet te respecteren
+        if period != periods[-1]:
+            time.sleep(PERIOD_PAUSE)
 
     # ===== FORECAST =====
     print(f"\n--- FORECAST: ECMWF + GFS, 8 days ---", flush=True)
