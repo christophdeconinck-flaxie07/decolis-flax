@@ -1,11 +1,10 @@
-name: Prefetch Weather Data
+name: Prefetch Weather Data (Daily)
 
 on:
+  # 1× per dag om 03:00 BE (= 01:00 UTC zomer / 02:00 UTC winter)
+  # We schedulen op beide tijden om beide seizoenen te dekken
   schedule:
-    - cron: '0 1 * * *'
-    - cron: '0 4 * * *'
-    - cron: '0 10 * * *'
-    - cron: '0 16 * * *'
+    - cron: '0 1 * * *'   # 03:00 BE summer / 02:00 BE winter
   workflow_dispatch:
 
 permissions:
@@ -15,27 +14,24 @@ jobs:
   prefetch:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Run prefetch script
+      - name: Run full prefetch
         run: python prefetch.py
-
-      - name: Commit and push updated data
+      - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase
           git add data/
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "Auto-update weather data $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git commit -m "Daily auto-update $(date -u +'%Y-%m-%d %H:%M UTC')"
             git push
           fi
