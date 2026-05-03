@@ -1074,7 +1074,7 @@ function renderAllCards() {
 
 // ====== CACHE ======
 // Cache strategie: "24h" = 1 uur geldig; alle andere periodes = tot middernacht lokale tijd
-const CACHE_STORAGE_KEY = "flax_cache_v2";
+const CACHE_STORAGE_KEY = "flax_cache_v3";  // bumped from v2 to invalidate stale cache
 
 function loadCacheFromStorage() {
   try {
@@ -1184,7 +1184,8 @@ async function loadAll(forceRefresh = false) {
       const ageTxt = ageSec < 60 ? `${ageSec}s` : `${Math.floor(ageSec/60)}min${ageSec % 60 > 0 ? " " + (ageSec%60) + "s" : ""}`;
       const expiresAt = getExpiryFor(currentPeriod, resultCache[currentPeriod].timestamp);
       const expTxt = new Date(expiresAt).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
-      log(`💾 Using cached results (${ageTxt} old, valid until ${expTxt})`);
+      const source = resultCache[currentPeriod].source === "github" ? "GitHub" : "cache";
+      log(`💾 Using cached results from ${source} (${ageTxt} old, valid until ${expTxt})`);
       lastResults = cached;
       renderAllCards();
       updateMapMarkers();
@@ -1192,11 +1193,11 @@ async function loadAll(forceRefresh = false) {
 
       // Cache is ouder dan 1 uur? Ververs op de achtergrond
       if (ageMs > BACKGROUND_REFRESH_AGE_MS) {
-        setStatus(`✅ Showing cached data · 🔄 refreshing in background...`, "ok");
+        setStatus(`✅ Showing data from ${source} · 🔄 refreshing in background...`, "ok");
         log(`🔄 Cache is >1h old, triggering background refresh...`);
         backgroundRefresh();
       } else {
-        setStatus(`✅ Loaded from cache · valid until ${expTxt} · click Refresh to reload now`, "ok");
+        setStatus(`✅ Loaded from ${source} · valid until ${expTxt} · click Refresh to reload now`, "ok");
       }
       return;
     }
@@ -1222,6 +1223,9 @@ async function loadAll(forceRefresh = false) {
       }
     }
     setCached(currentPeriod, lastResults);
+    // Mark this cache entry as coming from GitHub (for accurate status messages)
+    if (resultCache[currentPeriod]) resultCache[currentPeriod].source = "github";
+    saveCacheToStorage(resultCache);
     renderAllCards();
     updateMapMarkers();
     renderSummary();
