@@ -1130,6 +1130,46 @@ function setCached(period, results) {
 // Leeftijd waarboven we op achtergrond willen verversen
 const BACKGROUND_REFRESH_AGE_MS = 60 * 60 * 1000;  // 1 uur
 
+// ====== GITHUB DATA SOURCE ======
+// Primary source: pre-computed JSON files updated 4x/day by GitHub Actions
+// Fallback: live Open-Meteo API calls (current behavior)
+const GITHUB_DATA_BASE = "https://raw.githubusercontent.com/christophdeconinck-flaxie07/decolis-flax/main/data";
+let githubHistorical = null;  // Cached after first fetch
+let githubForecast = null;
+let githubFetchAttempted = false;
+let githubAvailable = false;
+
+async function fetchGitHubData() {
+  if (githubFetchAttempted) return githubAvailable;
+  githubFetchAttempted = true;
+  try {
+    log(`📡 Fetching pre-computed data from GitHub...`);
+    // Add cache buster to avoid stale CDN
+    const cb = Date.now();
+    const [histResp, fcResp] = await Promise.all([
+      fetch(`${GITHUB_DATA_BASE}/historical.json?_=${cb}`),
+      fetch(`${GITHUB_DATA_BASE}/forecast.json?_=${cb}`)
+    ]);
+    if (!histResp.ok) throw new Error(`historical.json: HTTP ${histResp.status}`);
+    if (!fcResp.ok) throw new Error(`forecast.json: HTTP ${fcResp.status}`);
+    githubHistorical = await histResp.json();
+    githubForecast = await fcResp.json();
+    githubAvailable = true;
+    const histAge = githubHistorical.timestamp ? new Date(githubHistorical.timestamp) : null;
+    log(`✅ GitHub data loaded (timestamp: ${histAge ? histAge.toLocaleString("en-GB") : "unknown"})`);
+    return true;
+  } catch (err) {
+    log(`⚠️ GitHub data not available, falling back to live API: ${err.message}`);
+    githubAvailable = false;
+    return false;
+  }
+}
+
+function getGitHubAge() {
+  if (!githubHistorical || !githubHistorical.timestamp) return null;
+  return new Date(githubHistorical.timestamp);
+}
+
 async function loadAll(forceRefresh = false) {
   debugLog = [];
   const totalPoints = regions.reduce((s, r) => s + r.points.length, 0);
@@ -1166,7 +1206,35 @@ async function loadAll(forceRefresh = false) {
   renderAllCards();
   updateMapMarkers();
   summaryEl.style.display = "none";
-  setStatus(`📡 Fetching data... (${regions.length} regions, ${totalPoints} measurement points)`, "");
+
+  // PROBEER EERST GITHUB JSON (super snel)
+  const githubOk = await fetchGitHubData();
+  if (githubOk && githubHistorical && githubHistorical.data && githubHistorical.data[currentPeriod]) {
+    const periodData = githubHistorical.data[currentPeriod];
+    let okCount = 0;
+    for (const region of regions) {
+      const r = periodData[region.name];
+      if (r && !r.error) {
+        lastResults[region.name] = r;
+        okCount++;
+      } else {
+        lastResults[region.name] = { error: r?.error || "missing data" };
+      }
+    }
+    setCached(currentPeriod, lastResults);
+    renderAllCards();
+    updateMapMarkers();
+    renderSummary();
+    const age = getGitHubAge();
+    const ageTxt = age ? age.toLocaleString("en-GB", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" }) : "unknown";
+    setStatus(`✅ Loaded from GitHub (data updated ${ageTxt}) · click Refresh to reload`, "ok");
+    log(`🚀 Loaded ${okCount}/${regions.length} regions from GitHub in <1s`);
+    return;
+  }
+
+  // FALLBACK: live API calls
+  log(`📡 Falling back to live Open-Meteo API...`);
+  setStatus(`📡 Fetching data live... (${regions.length} regions, ${totalPoints} measurement points)`, "");
 
   let successCount = 0, errorCount = 0, doneCount = 0;
   const startTime = Date.now();
@@ -1669,8 +1737,25 @@ async function loadForecast(forceRefresh = false) {
   }
 
   fcCountEl.textContent = "loading...";
+  gridEl.innerHTML = '<div style="padding:20px;text-align:center;color:#666;">📡 Fetching forecast...</div>';
+
+  // PROBEER EERST GITHUB JSON
+  const githubOk = await fetchGitHubData();
+  if (githubOk && githubForecast && githubForecast.data && githubForecast.data.regions) {
+    forecastData = githubForecast.data;
+    forecastCacheData = { timestamp: Date.now(), data: forecastData };
+    saveForecastCache(forecastCacheData);
+    renderForecastGrid();
+    const age = getGitHubAge();
+    const ageTxt = age ? age.toLocaleString("en-GB", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" }) : "unknown";
+    fcCountEl.textContent = `${forecastData.dates.length} days · GitHub (${ageTxt})`;
+    log(`🚀 Loaded forecast from GitHub in <1s`);
+    return;
+  }
+
+  // FALLBACK: live API
+  log(`🌤️ Starting forecast fetch: ECMWF + GFS, 8 days, ${regions.length} regions (live API)`);
   gridEl.innerHTML = '<div style="padding:20px;text-align:center;color:#666;">📡 Fetching forecast from ECMWF &amp; GFS models...</div>';
-  log(`🌤️ Starting forecast fetch: ECMWF + GFS, 8 days, ${regions.length} regions`);
 
   const startTime = Date.now();
   const perRegion = {};  // { regionName: { ecmwf: {...}, gfs: {...} } }
