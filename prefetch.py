@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Prefetch weather data for Flax Rainfall Monitor.
-Tuned for GitHub Actions: low parallelism, fast fail, verbose output.
+Prefetch weather data for Flax Rainfall Monitor (BULK version).
+Uses Open-Meteo's multi-coordinate endpoint: 1 call per region (instead of per point).
+Target runtime: 2-4 minutes.
 """
 
 import json
@@ -14,7 +15,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-# Force unbuffered output so logs appear in real time on GitHub Actions
 sys.stdout.reconfigure(line_buffering=True)
 
 REGION_DEFS = [
@@ -41,9 +41,9 @@ REGION_DEFS = [
     {"name": "Flevoland", "country": "NL", "bbox": [52.22, 5.15, 52.75, 5.90], "size": 8},
 ]
 
-PARALLEL_WORKERS = 5
-HTTP_TIMEOUT = 15  # seconds per call
-MAX_RETRIES = 2
+PARALLEL_WORKERS = 6  # We have ~21 calls per period, batch by region
+HTTP_TIMEOUT = 60  # seconds - bulk responses are bigger
+MAX_RETRIES = 3
 
 
 def generate_grid(bbox, n):
@@ -65,33 +65,82 @@ def http_get_json(url):
     last_err = None
     for attempt in range(MAX_RETRIES + 1):
         try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'flax-monitor-prefetch/1.0'})
+            req = urllib.request.Request(url, headers={'User-Agent': 'flax-monitor-prefetch/2.0'})
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
                 return json.loads(resp.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             last_err = e
             if e.code == 429 and attempt < MAX_RETRIES:
-                time.sleep(2 * (attempt + 1))
+                time.sleep(3 * (attempt + 1))
             else:
                 raise
         except Exception as e:
             last_err = e
             if attempt < MAX_RETRIES:
-                time.sleep(1)
+                time.sleep(2)
             else:
                 raise
     raise last_err if last_err else Exception("Unknown error")
 
 
-def fetch_historical_point(lat, lon, period):
-    tz = "Europe/Brussels"
+def fetch_historical_region_bulk(region, period):
+    """
+    BULK call: één request voor alle punten van een regio.
+    Returns: list of point-results (one per point, in order).
+    """
+    points = region['points']
+    lats = ",".join(str(p[0]) for p in points)
+    lons = ",".join(str(p[1]) for p in points)
+    tz = urllib.parse.quote("Europe/Brussels")
     base = "https://api.open-meteo.com/v1/forecast"
 
     if period == "24h":
-        url = (f"{base}?latitude={lat}&longitude={lon}"
+        url = (f"{base}?latitude={lats}&longitude={lons}"
                f"&hourly=precipitation,temperature_2m,et0_fao_evapotranspiration"
-               f"&past_days=2&forecast_days=1&timezone={urllib.parse.quote(tz)}")
-        data = http_get_json(url)
+               f"&past_days=2&forecast_days=1&timezone={tz}")
+    elif period == "yesterday":
+        url = (f"{base}?latitude={lats}&longitude={lons}"
+               f"&daily=precipitation_sum,temperature_2m_mean,temperature_2m_max,et0_fao_evapotranspiration"
+               f"&past_days=1&forecast_days=0&timezone={tz}")
+    else:
+        days_map = {"3d": 3, "5d": 5, "7d": 7, "14d": 14, "30d": 30}
+        if period in days_map:
+            days = days_map[period]
+            url = (f"{base}?latitude={lats}&longitude={lons}"
+                   f"&daily=precipitation_sum,temperature_2m_mean,temperature_2m_max,et0_fao_evapotranspiration"
+                   f"&past_days={days}&forecast_days=1&timezone={tz}")
+        elif period == "season":
+            year = datetime.now().year
+            start = f"{year}-03-01"
+            end = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            url = (f"https://archive-api.open-meteo.com/v1/archive?latitude={lats}&longitude={lons}"
+                   f"&daily=precipitation_sum,temperature_2m_mean,temperature_2m_max,et0_fao_evapotranspiration"
+                   f"&start_date={start}&end_date={end}&timezone={tz}")
+        else:
+            return None
+
+    response = http_get_json(url)
+
+    # Bulk endpoint returns either a list (multi-coord) or a dict (single coord).
+    # Normalize to list:
+    if isinstance(response, dict):
+        response = [response]
+
+    # Extract per-point result
+    point_results = []
+    for point_data in response:
+        try:
+            point_results.append(extract_historical_from_response(point_data, period))
+        except Exception as e:
+            point_results.append({"_error": str(e)[:80]})
+    return point_results
+
+
+def extract_historical_from_response(data, period):
+    """Extract aggregated stats for one point from API response."""
+    if period == "24h":
+        if 'hourly' not in data or 'precipitation' not in data['hourly']:
+            return None
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(hours=24)
         precip, et0, t_sum, t_max, count = 0, 0, 0, -999, 0
@@ -99,8 +148,10 @@ def fetch_historical_point(lat, lon, period):
             t = datetime.fromisoformat(t_str).replace(tzinfo=timezone.utc)
             if cutoff <= t <= now:
                 p = data['hourly']['precipitation'][i]
-                e = data['hourly'].get('et0_fao_evapotranspiration', [None]*len(data['hourly']['time']))[i]
-                temp = data['hourly'].get('temperature_2m', [None]*len(data['hourly']['time']))[i]
+                e_arr = data['hourly'].get('et0_fao_evapotranspiration')
+                e = e_arr[i] if e_arr else None
+                temp_arr = data['hourly'].get('temperature_2m')
+                temp = temp_arr[i] if temp_arr else None
                 if p is not None: precip += p
                 if e is not None: et0 += e
                 if temp is not None:
@@ -114,12 +165,8 @@ def fetch_historical_point(lat, lon, period):
                 "balance": precip - et0}
 
     if period == "yesterday":
-        url = (f"{base}?latitude={lat}&longitude={lon}"
-               f"&daily=precipitation_sum,temperature_2m_mean,temperature_2m_max,et0_fao_evapotranspiration"
-               f"&past_days=1&forecast_days=0&timezone={urllib.parse.quote(tz)}")
-        data = http_get_json(url)
-        d = data['daily']
-        if not d['precipitation_sum']:
+        d = data.get('daily', {})
+        if not d.get('precipitation_sum'):
             return None
         precip = d['precipitation_sum'][0] or 0
         et0 = (d.get('et0_fao_evapotranspiration', [0])[0]) or 0
@@ -128,24 +175,10 @@ def fetch_historical_point(lat, lon, period):
                 "tempMax": d.get('temperature_2m_max', [None])[0],
                 "balance": precip - et0}
 
-    days_map = {"3d": 3, "5d": 5, "7d": 7, "14d": 14, "30d": 30}
-    if period in days_map:
-        days = days_map[period]
-        url = (f"{base}?latitude={lat}&longitude={lon}"
-               f"&daily=precipitation_sum,temperature_2m_mean,temperature_2m_max,et0_fao_evapotranspiration"
-               f"&past_days={days}&forecast_days=1&timezone={urllib.parse.quote(tz)}")
-    elif period == "season":
-        year = datetime.now().year
-        start = f"{year}-03-01"
-        end = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        url = (f"https://archive-api.open-meteo.com/v1/archive?latitude={lat}&longitude={lon}"
-               f"&daily=precipitation_sum,temperature_2m_mean,temperature_2m_max,et0_fao_evapotranspiration"
-               f"&start_date={start}&end_date={end}&timezone={urllib.parse.quote(tz)}")
-    else:
+    # daily aggregates (3d, 5d, 7d, 14d, 30d, season)
+    d = data.get('daily', {})
+    if not d.get('precipitation_sum'):
         return None
-
-    data = http_get_json(url)
-    d = data['daily']
     precip = sum(v for v in d['precipitation_sum'] if v is not None)
     et0_list = d.get('et0_fao_evapotranspiration', []) or []
     et0 = sum(v for v in et0_list if v is not None) if et0_list else 0
@@ -159,31 +192,47 @@ def fetch_historical_point(lat, lon, period):
     }
 
 
-def fetch_forecast_point(lat, lon, model):
-    tz = "Europe/Brussels"
+def fetch_forecast_region_bulk(region, model):
+    """BULK forecast call: alle punten van een regio in één request."""
+    points = region['points']
+    lats = ",".join(str(p[0]) for p in points)
+    lons = ",".join(str(p[1]) for p in points)
+    tz = urllib.parse.quote("Europe/Brussels")
     model_param = "ecmwf_ifs025" if model == "ecmwf" else "gfs_seamless"
-    url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+    url = (f"https://api.open-meteo.com/v1/forecast?latitude={lats}&longitude={lons}"
            f"&daily=precipitation_sum,precipitation_probability_max,temperature_2m_max,temperature_2m_min"
-           f"&models={model_param}&forecast_days=8&timezone={urllib.parse.quote(tz)}")
-    data = http_get_json(url)
-    d = data.get('daily', {})
-    return {
-        "dates": d.get('time', []),
-        "precip": d.get('precipitation_sum', []),
-        "prob": d.get('precipitation_probability_max', []),
-        "tmax": d.get('temperature_2m_max', []),
-        "tmin": d.get('temperature_2m_min', [])
-    }
+           f"&models={model_param}&forecast_days=8&timezone={tz}")
+
+    response = http_get_json(url)
+    if isinstance(response, dict):
+        response = [response]
+
+    point_results = []
+    for point_data in response:
+        try:
+            d = point_data.get('daily', {})
+            point_results.append({
+                "dates": d.get('time', []),
+                "precip": d.get('precipitation_sum', []),
+                "prob": d.get('precipitation_probability_max', []),
+                "tmax": d.get('temperature_2m_max', []),
+                "tmin": d.get('temperature_2m_min', [])
+            })
+        except Exception as e:
+            point_results.append({"_error": str(e)[:80]})
+    return point_results
 
 
 def safe_call(fn, *args):
     try:
         return fn(*args)
     except Exception as e:
-        return {"_error": str(e)[:80]}
+        return None  # marks the entire region as failed
 
 
 def aggregate_region(points_data, period):
+    if not points_data:
+        return None
     valid = [p for p in points_data if p is not None and not (isinstance(p, dict) and "_error" in p)]
     if not valid:
         return None
@@ -207,6 +256,8 @@ def aggregate_region(points_data, period):
 
 
 def aggregate_forecast_region(points_data):
+    if not points_data:
+        return None
     valid = [p for p in points_data if p and not (isinstance(p, dict) and "_error" in p) and p.get('dates')]
     if not valid:
         return None
@@ -222,17 +273,16 @@ def aggregate_forecast_region(points_data):
 
 def main():
     start_total = time.time()
-    print("=== Flax Rainfall Monitor Prefetch ===", flush=True)
+    print("=== Flax Rainfall Monitor Prefetch (BULK) ===", flush=True)
     print(f"Started at: {datetime.now(timezone.utc).isoformat()}", flush=True)
 
-    # Quick connectivity test
+    # Connectivity test
     print("\nTesting Open-Meteo connectivity...", flush=True)
     try:
-        test = http_get_json("https://api.open-meteo.com/v1/forecast?latitude=50&longitude=4&hourly=precipitation&forecast_days=1")
+        http_get_json("https://api.open-meteo.com/v1/forecast?latitude=50&longitude=4&hourly=precipitation&forecast_days=1")
         print("  ✓ API reachable", flush=True)
     except Exception as e:
         print(f"  ✗ API test failed: {e}", flush=True)
-        print("  Aborting - will retry on next scheduled run", flush=True)
         sys.exit(1)
 
     regions = []
@@ -240,8 +290,11 @@ def main():
         regions.append({**r, "points": generate_grid(r["bbox"], r["size"])})
 
     total_points = sum(len(r["points"]) for r in regions)
-    print(f"\n{len(regions)} regions, {total_points} measurement points, {PARALLEL_WORKERS} parallel workers", flush=True)
+    print(f"\n{len(regions)} regions, {total_points} measurement points", flush=True)
+    print(f"Bulk strategy: 1 API call per region = {len(regions)} calls per period", flush=True)
+    print(f"Total expected: {len(regions) * 8} historical calls + {len(regions) * 2} forecast calls = {len(regions) * 10} calls", flush=True)
 
+    # ===== HISTORICAL =====
     historical = {}
     periods = ["24h", "yesterday", "3d", "5d", "7d", "14d", "30d", "season"]
 
@@ -249,29 +302,20 @@ def main():
         t0 = time.time()
         print(f"\n--- HISTORICAL: {period} ---", flush=True)
 
-        tasks = []
-        for region in regions:
-            for lat, lon in region['points']:
-                tasks.append((region['name'], lat, lon))
-
-        results_by_region = {r['name']: [] for r in regions}
-        completed = 0
         with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as ex:
-            future_to_task = {
-                ex.submit(safe_call, fetch_historical_point, lat, lon, period): region_name
-                for (region_name, lat, lon) in tasks
+            future_to_region = {
+                ex.submit(safe_call, fetch_historical_region_bulk, region, period): region
+                for region in regions
             }
-            for fut in as_completed(future_to_task):
-                region_name = future_to_task[fut]
-                results_by_region[region_name].append(fut.result())
-                completed += 1
-                if completed % 50 == 0:
-                    print(f"  ...{completed}/{len(tasks)} points done", flush=True)
+            results_by_region = {}
+            for fut in as_completed(future_to_region):
+                region = future_to_region[fut]
+                results_by_region[region['name']] = fut.result()
 
         period_results = {}
         ok_regions = 0
         for region in regions:
-            agg = aggregate_region(results_by_region[region['name']], period)
+            agg = aggregate_region(results_by_region.get(region['name']), period)
             if agg:
                 period_results[region['name']] = agg
                 ok_regions += 1
@@ -280,28 +324,25 @@ def main():
         historical[period] = period_results
         print(f"  → {period} done in {time.time()-t0:.1f}s ({ok_regions}/{len(regions)} regions ok)", flush=True)
 
-    # Forecast
+    # ===== FORECAST =====
     print(f"\n--- FORECAST: ECMWF + GFS, 8 days ---", flush=True)
     t0 = time.time()
+
+    # Build tasks: (region, model)
     tasks = []
     for region in regions:
-        for lat, lon in region['points']:
-            tasks.append((region['name'], lat, lon, "ecmwf"))
-            tasks.append((region['name'], lat, lon, "gfs"))
+        tasks.append((region, "ecmwf"))
+        tasks.append((region, "gfs"))
 
-    forecast_data = {r['name']: {"ecmwf": [], "gfs": []} for r in regions}
-    completed = 0
+    forecast_data = {r['name']: {"ecmwf": None, "gfs": None} for r in regions}
     with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as ex:
         future_to_task = {
-            ex.submit(safe_call, fetch_forecast_point, lat, lon, model): (region_name, model)
-            for (region_name, lat, lon, model) in tasks
+            ex.submit(safe_call, fetch_forecast_region_bulk, region, model): (region['name'], model)
+            for (region, model) in tasks
         }
         for fut in as_completed(future_to_task):
             region_name, model = future_to_task[fut]
-            forecast_data[region_name][model].append(fut.result())
-            completed += 1
-            if completed % 100 == 0:
-                print(f"  ...{completed}/{len(tasks)} forecast points done", flush=True)
+            forecast_data[region_name][model] = fut.result()
 
     forecast_per_region = {}
     forecast_dates = None
@@ -316,6 +357,7 @@ def main():
 
     forecast = {"dates": forecast_dates, "regions": forecast_per_region} if forecast_dates else None
 
+    # ===== WRITE =====
     Path("data").mkdir(exist_ok=True)
     timestamp = datetime.now(timezone.utc).isoformat()
 
