@@ -1,7 +1,6 @@
 name: Prefetch 24h (Hourly)
 
 on:
-  # Elk uur, 30 minuten over om geen botsing met daily run te hebben
   schedule:
     - cron: '30 * * * *'
   workflow_dispatch:
@@ -20,17 +19,21 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Run hourly 24h prefetch
+      - name: Run hourly today prefetch
         run: python prefetch_hourly.py
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git pull --rebase
+          # Stage changes first, then pull with rebase, then push
           git add data/
           if git diff --staged --quiet; then
             echo "No changes to commit"
-          else
-            git commit -m "Hourly 24h update $(date -u +'%Y-%m-%d %H:%M UTC')"
-            git push
+            exit 0
           fi
+          git stash
+          git pull --rebase
+          git stash pop || true
+          git add data/
+          git commit -m "Hourly today update $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
