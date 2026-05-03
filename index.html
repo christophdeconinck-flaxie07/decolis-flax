@@ -514,7 +514,7 @@
 </header>
 
 <div class="controls">
-  <button class="btn active" data-period="24h">Last 24h</button>
+  <button class="btn active" data-period="24h">Today</button>
   <button class="btn" data-period="yesterday">Yesterday</button>
   <button class="btn" data-period="3d">3 days</button>
   <button class="btn" data-period="5d">5 days</button>
@@ -1363,7 +1363,7 @@ function renderSummary() {
 // ====== PDF EXPORT ======
 function periodLabel(p) {
   return {
-    "24h": "Last 24 hours",
+    "24h": "Today (since midnight)",
     "yesterday": "Yesterday",
     "3d": "Last 3 days",
     "5d": "Last 5 days",
