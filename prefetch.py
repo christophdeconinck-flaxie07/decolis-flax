@@ -47,6 +47,18 @@ MAX_RETRIES = 3
 PERIOD_PAUSE = 5  # seconds pause between historical periods to respect rate limits
 
 
+def get_brussels_today_start_utc():
+    """Returns UTC datetime corresponding to today 00:00 Brussels time."""
+    now_utc = datetime.now(timezone.utc)
+    month = now_utc.month
+    is_summer = month in [4, 5, 6, 7, 8, 9]
+    offset_hours = 2 if is_summer else 1
+    local_now = now_utc + timedelta(hours=offset_hours)
+    local_today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_utc = local_today_start - timedelta(hours=offset_hours)
+    return today_start_utc
+
+
 def generate_grid(bbox, n):
     south, west, north, east = bbox
     lat_span = north - south
@@ -98,9 +110,10 @@ def fetch_historical_region_bulk(region, period):
     base = "https://api.open-meteo.com/v1/forecast"
 
     if period == "24h":
+        # past_days=1 covers today + yesterday (genoeg om today since midnight te dekken)
         url = (f"{base}?latitude={lats}&longitude={lons}"
                f"&hourly=precipitation,temperature_2m,et0_fao_evapotranspiration"
-               f"&past_days=2&forecast_days=1&timezone={tz}")
+               f"&past_days=1&forecast_days=1&timezone={tz}")
     elif period == "yesterday":
         url = (f"{base}?latitude={lats}&longitude={lons}"
                f"&daily=precipitation_sum,temperature_2m_mean,temperature_2m_max,et0_fao_evapotranspiration"
@@ -142,14 +155,20 @@ def fetch_historical_region_bulk(region, period):
 def extract_historical_from_response(data, period):
     """Extract aggregated stats for one point from API response."""
     if period == "24h":
+        # NOTE: key blijft "24h" voor backward compat, betekenis = today since midnight Brussels
         if 'hourly' not in data or 'precipitation' not in data['hourly']:
             return None
+        today_start = get_brussels_today_start_utc()
         now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(hours=24)
         precip, et0, t_sum, t_max, count = 0, 0, 0, -999, 0
         for i, t_str in enumerate(data['hourly']['time']):
-            t = datetime.fromisoformat(t_str).replace(tzinfo=timezone.utc)
-            if cutoff <= t <= now:
+            # Open-Meteo returns local time (Brussels) when timezone param is set.
+            # Convert local naive datetime to UTC for comparison.
+            t_local_naive = datetime.fromisoformat(t_str)
+            month_check = t_local_naive.month
+            offset_h = 2 if month_check in [4, 5, 6, 7, 8, 9] else 1
+            t_utc = t_local_naive.replace(tzinfo=timezone.utc) - timedelta(hours=offset_h)
+            if today_start <= t_utc <= now:
                 p = data['hourly']['precipitation'][i]
                 e_arr = data['hourly'].get('et0_fao_evapotranspiration')
                 e = e_arr[i] if e_arr else None
@@ -162,7 +181,8 @@ def extract_historical_from_response(data, period):
                     count += 1
                     if temp > t_max: t_max = temp
         if count == 0:
-            return None
+            # Vroeg in de ochtend: nog geen data sinds middernacht — return zero
+            return {"precip": 0, "et0": 0, "tempMean": None, "tempMax": None, "balance": 0}
         return {"precip": precip, "et0": et0,
                 "tempMean": t_sum/count, "tempMax": t_max if t_max != -999 else None,
                 "balance": precip - et0}
