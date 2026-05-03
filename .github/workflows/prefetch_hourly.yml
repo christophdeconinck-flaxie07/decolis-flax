@@ -1,0 +1,36 @@
+name: Prefetch 24h (Hourly)
+
+on:
+  # Elk uur, 30 minuten over om geen botsing met daily run te hebben
+  schedule:
+    - cron: '30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prefetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run hourly 24h prefetch
+        run: python prefetch_hourly.py
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase
+          git add data/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Hourly 24h update $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
