@@ -1295,6 +1295,35 @@ async function loadAll(forceRefresh = false) {
 async function backgroundRefresh() {
   const period = currentPeriod;
   const startTime = Date.now();
+
+  // PROBEER EERST GITHUB JSON OPNIEUW (vers ophalen)
+  githubFetchAttempted = false;  // force re-fetch
+  const githubOk = await fetchGitHubData();
+  if (githubOk && githubHistorical && githubHistorical.data && githubHistorical.data[period]) {
+    if (currentPeriod !== period) return;  // user switched away
+    const periodData = githubHistorical.data[period];
+    const bgResults = {};
+    for (const region of regions) {
+      const r = periodData[region.name];
+      if (r && !r.error) bgResults[region.name] = r;
+      else bgResults[region.name] = { error: r?.error || "missing data" };
+    }
+    lastResults = bgResults;
+    setCached(period, bgResults);
+    if (resultCache[period]) resultCache[period].source = "github";
+    saveCacheToStorage(resultCache);
+    renderAllCards();
+    updateMapMarkers();
+    renderSummary();
+    const expiresAt = getExpiryFor(period, Date.now());
+    const expTxt = new Date(expiresAt).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+    setStatus(`✅ Fresh data from GitHub · valid until ${expTxt}`, "ok");
+    log(`🔄 Background refresh: re-loaded from GitHub in ${Math.round((Date.now() - startTime)/1000)}s`);
+    return;
+  }
+
+  // FALLBACK: live API
+  log(`⚠️ Background refresh falling back to live API`);
   const bgResults = {};
   let successCount = 0, errorCount = 0;
   const REGION_PARALLEL = 2;
@@ -1313,7 +1342,6 @@ async function backgroundRefresh() {
   for (let i = 0; i < regions.length; i += REGION_PARALLEL) {
     const chunk = regions.slice(i, i + REGION_PARALLEL);
     await Promise.all(chunk.map(loadOneBg));
-    // Periode kan gewisseld zijn tijdens laden; annuleer als de gebruiker een andere periode heeft gekozen
     if (currentPeriod !== period) {
       log(`🔄 Background refresh aborted (period changed)`);
       return;
@@ -1818,6 +1846,24 @@ async function loadForecast(forceRefresh = false) {
 async function backgroundRefreshForecast() {
   const fcCountEl = document.getElementById("fcCount");
   const startTime = Date.now();
+
+  // PROBEER EERST GITHUB JSON (vers ophalen, niet uit cache)
+  githubFetchAttempted = false;  // force re-fetch
+  const githubOk = await fetchGitHubData();
+  if (githubOk && githubForecast && githubForecast.data && githubForecast.data.regions) {
+    forecastData = githubForecast.data;
+    forecastCacheData = { timestamp: Date.now(), data: forecastData };
+    saveForecastCache(forecastCacheData);
+    renderForecastGrid();
+    const age = getGitHubAge();
+    const ageTxt = age ? age.toLocaleString("en-GB", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" }) : "unknown";
+    fcCountEl.textContent = `${forecastData.dates.length} days · GitHub (${ageTxt})`;
+    log(`🔄 Background forecast refresh: re-loaded from GitHub in ${Math.round((Date.now() - startTime)/1000)}s`);
+    return;
+  }
+
+  // FALLBACK: live API (zwaar - 46 calls)
+  log(`⚠️ Background refresh falling back to live API (slow)`);
   const perRegion = {};
   const REGION_PARALLEL = 2;
 
