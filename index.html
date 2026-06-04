@@ -1187,6 +1187,13 @@ async function loadAll(forceRefresh = false) {
       const expiresAt = getExpiryFor(currentPeriod, resultCache[currentPeriod].timestamp);
       const expTxt = new Date(expiresAt).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
       const source = resultCache[currentPeriod].source === "github" ? "GitHub" : "cache";
+      // Format GitHub data timestamp if available
+      const ghTs = resultCache[currentPeriod].githubTimestamp;
+      let dataInfo = "";
+      if (source === "GitHub" && ghTs) {
+        const ghTxt = new Date(ghTs).toLocaleString("en-GB", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" });
+        dataInfo = ` (data from ${ghTxt})`;
+      }
       log(`💾 Using cached results from ${source} (${ageTxt} old, valid until ${expTxt})`);
       lastResults = cached;
       renderAllCards();
@@ -1195,11 +1202,11 @@ async function loadAll(forceRefresh = false) {
 
       // Cache is ouder dan 1 uur? Ververs op de achtergrond
       if (ageMs > BACKGROUND_REFRESH_AGE_MS) {
-        setStatus(`✅ Showing data from ${source} · 🔄 refreshing in background...`, "ok");
+        setStatus(`✅ Showing data from ${source}${dataInfo} · 🔄 refreshing in background...`, "ok");
         log(`🔄 Cache is >1h old, triggering background refresh...`);
         backgroundRefresh();
       } else {
-        setStatus(`✅ Loaded from ${source} · valid until ${expTxt} · click Refresh to reload now`, "ok");
+        setStatus(`✅ Loaded from ${source}${dataInfo} · valid until ${expTxt} · click Refresh to reload now`, "ok");
       }
       return;
     }
@@ -1226,7 +1233,10 @@ async function loadAll(forceRefresh = false) {
     }
     setCached(currentPeriod, lastResults);
     // Mark this cache entry as coming from GitHub (for accurate status messages)
-    if (resultCache[currentPeriod]) resultCache[currentPeriod].source = "github";
+    if (resultCache[currentPeriod]) {
+      resultCache[currentPeriod].source = "github";
+      resultCache[currentPeriod].githubTimestamp = githubHistorical.timestamp || null;
+    }
     saveCacheToStorage(resultCache);
     renderAllCards();
     updateMapMarkers();
@@ -1310,7 +1320,10 @@ async function backgroundRefresh() {
     }
     lastResults = bgResults;
     setCached(period, bgResults);
-    if (resultCache[period]) resultCache[period].source = "github";
+    if (resultCache[period]) {
+      resultCache[period].source = "github";
+      resultCache[period].githubTimestamp = githubHistorical.timestamp || null;
+    }
     saveCacheToStorage(resultCache);
     renderAllCards();
     updateMapMarkers();
@@ -1758,8 +1771,16 @@ async function loadForecast(forceRefresh = false) {
       forecastData = cached.data;
       renderForecastGrid();
       const ageMs = Date.now() - cached.timestamp;
-      const ageMin = Math.round(ageMs / 60000);
-      fcCountEl.textContent = `${forecastData.dates.length} days · cached (${ageMin}min ago)`;
+      // Toon waar de data oorspronkelijk vandaan kwam (GitHub timestamp), niet de cache leeftijd
+      if (cached.githubTimestamp) {
+        const ghDate = new Date(cached.githubTimestamp);
+        const ghTxt = ghDate.toLocaleString("en-GB", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" });
+        fcCountEl.textContent = `${forecastData.dates.length} days · GitHub data from ${ghTxt}`;
+      } else {
+        // Oude cache zonder githubTimestamp
+        const ageMin = Math.round(ageMs / 60000);
+        fcCountEl.textContent = `${forecastData.dates.length} days · cached (${ageMin}min ago)`;
+      }
 
       // Cache ouder dan 1 uur? Ververs stil op achtergrond
       if (ageMs > BACKGROUND_REFRESH_AGE_MS) {
@@ -1777,12 +1798,17 @@ async function loadForecast(forceRefresh = false) {
   const githubOk = await fetchGitHubData();
   if (githubOk && githubForecast && githubForecast.data && githubForecast.data.regions) {
     forecastData = githubForecast.data;
-    forecastCacheData = { timestamp: Date.now(), data: forecastData };
+    // Sla GitHub data timestamp mee op zodat we hem later kunnen tonen
+    forecastCacheData = {
+      timestamp: Date.now(),
+      githubTimestamp: githubForecast.timestamp || null,
+      data: forecastData
+    };
     saveForecastCache(forecastCacheData);
     renderForecastGrid();
     const age = getGitHubAge();
     const ageTxt = age ? age.toLocaleString("en-GB", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" }) : "unknown";
-    fcCountEl.textContent = `${forecastData.dates.length} days · GitHub (${ageTxt})`;
+    fcCountEl.textContent = `${forecastData.dates.length} days · GitHub data from ${ageTxt}`;
     log(`🚀 Loaded forecast from GitHub in <1s`);
     return;
   }
@@ -1852,12 +1878,16 @@ async function backgroundRefreshForecast() {
   const githubOk = await fetchGitHubData();
   if (githubOk && githubForecast && githubForecast.data && githubForecast.data.regions) {
     forecastData = githubForecast.data;
-    forecastCacheData = { timestamp: Date.now(), data: forecastData };
+    forecastCacheData = {
+      timestamp: Date.now(),
+      githubTimestamp: githubForecast.timestamp || null,
+      data: forecastData
+    };
     saveForecastCache(forecastCacheData);
     renderForecastGrid();
     const age = getGitHubAge();
     const ageTxt = age ? age.toLocaleString("en-GB", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" }) : "unknown";
-    fcCountEl.textContent = `${forecastData.dates.length} days · GitHub (${ageTxt})`;
+    fcCountEl.textContent = `${forecastData.dates.length} days · GitHub data from ${ageTxt}`;
     log(`🔄 Background forecast refresh: re-loaded from GitHub in ${Math.round((Date.now() - startTime)/1000)}s`);
     return;
   }
