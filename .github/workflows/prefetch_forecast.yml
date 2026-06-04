@@ -1,0 +1,42 @@
+name: Prefetch Forecast (Afternoon)
+
+on:
+  # 15:00 BE summer = 13:00 UTC ; 15:00 BE winter = 14:00 UTC
+  # We schedulen op beide om beide seizoenen te dekken
+  schedule:
+    - cron: '0 13 * * *'   # 15:00 BE zomer
+    - cron: '0 14 * * *'   # 15:00 BE winter
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prefetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run forecast-only prefetch
+        run: python prefetch_forecast.py
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git stash
+          git pull --rebase
+          git stash pop || true
+          git add data/
+          git commit -m "Afternoon forecast update $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
+3️⃣ Test (optioneel)
